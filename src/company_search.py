@@ -1,38 +1,96 @@
 """A股上市公司搜索：按简称或代码查找"""
 
 import difflib
+import json
+from pathlib import Path
+
 import pandas as pd
-import akshare as ak
 
 _stock_list_cache: pd.DataFrame | None = None
+_STOCK_LIST_FILE = Path(__file__).parent / "stock_list.json"
 
 
 def get_stock_list() -> pd.DataFrame:
-    """获取A股全量列表，带缓存。返回 DataFrame: code, name, market"""
+    """获取A股全量列表。优先本地缓存，失败时尝试在线获取。"""
     global _stock_list_cache
     if _stock_list_cache is not None:
         return _stock_list_cache
 
-    # 优先用 stock_info_a_code_name
+    # 1. 优先从本地JSON加载（最可靠）
+    try:
+        df = _load_from_json()
+        if df is not None and len(df) > 1000:
+            _stock_list_cache = df
+            return df
+    except Exception:
+        pass
+
+    # 2. 尝试在线获取
+    try:
+        df = _fetch_online()
+        if df is not None and len(df) > 1000:
+            _stock_list_cache = df
+            return df
+    except Exception:
+        pass
+
+    # 3. 如果在线获取也失败，再试一次JSON
+    try:
+        df = _load_from_json()
+        if df is not None:
+            _stock_list_cache = df
+            return df
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "无法获取A股股票列表。请确保 src/stock_list.json 文件存在，"
+        "或网络可访问东方财富/巨潮资讯网。"
+    )
+
+
+def _load_from_json() -> pd.DataFrame | None:
+    """从本地JSON文件加载股票列表"""
+    if not _STOCK_LIST_FILE.exists():
+        return None
+    with open(_STOCK_LIST_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    df = pd.DataFrame(data)
+    df["code"] = df["code"].astype(str).str.zfill(6)
+    df["market"] = df["code"].apply(_code_to_market)
+    return df
+
+
+def _fetch_online() -> pd.DataFrame | None:
+    """在线获取股票列表"""
+    import akshare as ak
+
+    # 尝试 stock_zh_a_spot_em（东方财富，海外可访问）
+    try:
+        df = ak.stock_zh_a_spot_em()
+        if "代码" in df.columns and "名称" in df.columns:
+            df = df[["代码", "名称"]].copy()
+            df.columns = ["code", "name"]
+            df["code"] = df["code"].astype(str).str.zfill(6)
+            df["market"] = df["code"].apply(_code_to_market)
+            if len(df) > 1000:
+                return df
+    except Exception:
+        pass
+
+    # 尝试 stock_info_a_code_name
     try:
         df = ak.stock_info_a_code_name()
         if "code" in df.columns and "name" in df.columns:
             df = df[["code", "name"]].copy()
-        else:
-            raise ValueError("列名不匹配")
+            df["code"] = df["code"].astype(str).str.zfill(6)
+            df["market"] = df["code"].apply(_code_to_market)
+            if len(df) > 1000:
+                return df
     except Exception:
-        # 回退：使用 stock_zh_a_spot_em
-        try:
-            df = ak.stock_zh_a_spot_em()
-            df = df[["代码", "名称"]].copy()
-            df.columns = ["code", "name"]
-        except Exception as e:
-            raise RuntimeError(f"无法获取A股股票列表，请检查 akshare 安装和网络连接。错误：{e}")
+        pass
 
-    df["code"] = df["code"].astype(str).str.zfill(6)
-    df["market"] = df["code"].apply(_code_to_market)
-    _stock_list_cache = df
-    return df
+    return None
 
 
 def _code_to_market(code: str) -> str:
@@ -56,11 +114,9 @@ def search_company(query: str, limit: int = 20) -> list[dict]:
     df = get_stock_list()
 
     if query.isdigit():
-        # 按代码搜索
         mask = df["code"].str.startswith(query)
         results = df[mask].copy()
     else:
-        # 按名称搜索
         exact = df[df["name"] == query]
         if not exact.empty:
             results = exact.copy()
@@ -69,7 +125,6 @@ def search_company(query: str, limit: int = 20) -> list[dict]:
             if not substring.empty:
                 results = substring.copy()
             else:
-                # 模糊匹配
                 all_names = df["name"].tolist()
                 close = difflib.get_close_matches(query, all_names, n=limit, cutoff=0.5)
                 results = df[df["name"].isin(close)].copy()
