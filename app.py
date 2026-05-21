@@ -1,0 +1,265 @@
+"""A股上市公司公告下载与表格提取工具 - Streamlit主界面"""
+
+import sys
+import io
+from pathlib import Path
+from datetime import datetime, timedelta
+
+import streamlit as st
+import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from config import DOC_TYPE_LABELS, DOWNLOAD_DIR
+from src.company_search import search_company
+from src.filing_fetcher import fetch_filing_list, download_filings
+from src.table_extractor import extract_tables_from_pdf
+from src.excel_writer import write_tables_to_excel
+
+st.set_page_config(
+    page_title="A股公告下载工具",
+    page_icon="📄",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+# ---------- session state 初始化 ----------
+for key, val in {
+    "step": "search",
+    "search_results": [],
+    "selected_company": None,
+    "doc_types": ["年度报告", "季度报告"],
+    "date_range": (
+        datetime.now().date() - timedelta(days=3 * 365),
+        datetime.now().date(),
+    ),
+    "filing_df": None,
+    "results": None,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = val
+
+
+# ==================== 侧边栏 ====================
+with st.sidebar:
+    st.header("⚙️ 设置")
+    st.markdown(f"**输出目录：** `{DOWNLOAD_DIR}`")
+    if st.button("🔄 重置所有状态"):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.rerun()
+
+# ==================== 主界面 ====================
+st.title("📄 A股上市公司公告下载与表格提取工具")
+st.caption("数据来源：巨潮资讯网 (cninfo.com.cn)  |  支持沪深北三地上市公司  |  自动提取表格生成Excel")
+
+# ---------- 步骤一：搜索公司 ----------
+st.header("步骤一：搜索公司")
+
+col1, col2 = st.columns([4, 1])
+with col1:
+    query = st.text_input(
+        "输入公司简称或股票代码",
+        placeholder="例如：贵州茅台 或 600519",
+        label_visibility="collapsed",
+        key="search_input",
+    )
+with col2:
+    search_btn = st.button("🔍 搜索", use_container_width=True, type="primary")
+
+if search_btn and query.strip():
+    with st.spinner("正在从巨潮资讯网获取股票列表..."):
+        st.session_state.search_results = search_company(query.strip())
+    if not st.session_state.search_results:
+        st.warning("未找到匹配的公司，请尝试完整的公司名称或6位股票代码。")
+
+if st.session_state.search_results:
+    st.subheader("搜索结果（点击选择）")
+    opts = {}
+    for r in st.session_state.search_results:
+        label = f"{r['code']}  |  {r['name']}  |  {r['market']}"
+        opts[label] = r
+
+    selected = st.radio("选择公司", list(opts.keys()), label_visibility="collapsed")
+    if selected:
+        st.session_state.selected_company = opts[selected]
+
+# ---------- 步骤二 & 三：条件与查询 ----------
+if st.session_state.selected_company:
+    company = st.session_state.selected_company
+    st.markdown(f"**已选：** `{company['code']}` {company['name']}（{company['market']}）")
+
+    st.header("步骤二：选择条件")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        start_date = st.date_input("开始日期", value=st.session_state.date_range[0])
+    with col2:
+        end_date = st.date_input("结束日期", value=st.session_state.date_range[1])
+    st.session_state.date_range = (start_date, end_date)
+
+    st.markdown("**文件类型（可多选）：**")
+    doc_types = []
+    cols = st.columns(3)
+    for idx, (key, label) in enumerate(DOC_TYPE_LABELS.items()):
+        with cols[idx % 3]:
+            if st.checkbox(label, value=key in st.session_state.doc_types, key=f"dt_{key}"):
+                doc_types.append(key)
+    st.session_state.doc_types = doc_types
+
+    st.header("步骤三：查询公告")
+    if st.button("📋 查询公告列表", type="primary", disabled=not doc_types):
+        if not doc_types:
+            st.warning("请至少选择一种文件类型。")
+        else:
+            with st.spinner("正在查询巨潮资讯网..."):
+                code = company["code"]
+                sd = start_date.strftime("%Y%m%d")
+                ed = end_date.strftime("%Y%m%d")
+
+                pbar = st.progress(0)
+                stat = st.empty()
+
+                def on_prog(cur, total, msg=""):
+                    pbar.progress(cur / max(total, 1))
+                    stat.text(msg)
+
+                df = fetch_filing_list(code, doc_types, sd, ed, on_prog)
+                st.session_state.filing_df = df
+                pbar.empty()
+                stat.empty()
+
+                if df.empty:
+                    st.warning("未找到符合条件的公告。")
+                else:
+                    st.rerun()
+
+# ---------- 步骤四：选择公告 ----------
+if st.session_state.filing_df is not None and not st.session_state.filing_df.empty:
+    df = st.session_state.filing_df
+    st.header("步骤四：选择要下载的公告")
+    st.markdown(f"共找到 **{len(df)}** 份公告")
+
+    # 分类统计
+    if "文档类型" in df.columns:
+        tc = df["文档类型"].value_counts()
+        cols = st.columns(len(tc))
+        for i, (t, c) in enumerate(tc.items()):
+            with cols[i]:
+                st.metric(t, f"{c} 份")
+
+    all_checked = st.checkbox("全选 / 取消全选", value=False, key="select_all")
+
+    selected_indices = []
+    for i, (_, row) in enumerate(df.iterrows()):
+        title = str(row.get("公告标题", ""))
+        date_str = str(row.get("公告时间", ""))[:10]
+        doc_type = str(row.get("文档类型", ""))
+        checked = st.checkbox(
+            f"[{date_str}] [{doc_type}] {title}",
+            value=all_checked,
+            key=f"fl_{i}",
+        )
+        if checked:
+            selected_indices.append(i)
+
+    # ---------- 步骤五：下载与提取 ----------
+    st.header("步骤五：下载与提取表格")
+    if st.button("📥 开始下载并提取表格", type="primary", disabled=not selected_indices):
+        selected_df = df.iloc[selected_indices].reset_index(drop=True)
+        company_name = company["name"]
+        stock_code = company["code"]
+
+        out_root = DOWNLOAD_DIR / f"{stock_code}_{company_name}"
+        pdf_dir = out_root / "PDF"
+        excel_dir = out_root / "Excel"
+        pdf_dir.mkdir(parents=True, exist_ok=True)
+        excel_dir.mkdir(parents=True, exist_ok=True)
+
+        status_widget = st.status("正在处理...", expanded=True)
+        overall_progress = st.progress(0)
+
+        try:
+            # ---- Phase 1: 下载PDF ----
+            status_widget.write("📥 下载公告PDF文件...")
+
+            def dl_prog(cur, total, fname):
+                pct = (cur + 1) / max(total, 1) * 0.40
+                overall_progress.progress(pct)
+                status_widget.write(f"📥 ({cur + 1}/{total}) {fname}")
+
+            pdfs = download_filings(selected_df, pdf_dir, dl_prog)
+            status_widget.write(f"✅ 下载完成：{len(pdfs)}/{len(selected_df)} 份PDF")
+            overall_progress.progress(0.45)
+
+            # ---- Phase 2: 提取表格 ----
+            status_widget.write("📊 提取表格...")
+            all_tables = []
+            total_pdfs = len(pdfs)
+
+            for j, pdf_path in enumerate(pdfs):
+                title = pdf_path.stem
+
+                def ext_prog(cur, total):
+                    pct = 0.45 + (j / max(total_pdfs, 1)) * 0.25
+                    pct += (cur / max(total, 1)) * (0.25 / max(total_pdfs, 1))
+                    overall_progress.progress(min(pct, 0.75))
+
+                tables = extract_tables_from_pdf(pdf_path, ext_prog)
+                all_tables.extend(tables)
+                status_widget.write(f"   {title}: {len(tables)} 个表格")
+
+            status_widget.write(f"✅ 共提取 {len(all_tables)} 个表格")
+            overall_progress.progress(0.80)
+
+            # ---- Phase 3: 生成Excel ----
+            status_widget.write("📝 生成Excel文件...")
+            excel_files = write_tables_to_excel(
+                all_tables,
+                excel_dir,
+                company_name,
+                "综合报告" if len(selected_df) > 1 else str(selected_df.iloc[0].get("公告标题", "")),
+                str(selected_df.iloc[0].get("公告时间", ""))[:4],
+                "、".join(set(selected_df["文档类型"].tolist())),
+            )
+            overall_progress.progress(0.95)
+
+            status_widget.write(f"✅ Excel生成完成：{len(excel_files)} 个文件")
+            overall_progress.progress(1.0)
+
+            st.session_state.results = {
+                "pdf_count": len(pdfs),
+                "table_count": len(all_tables),
+                "excel_count": len(excel_files),
+                "output_dir": str(out_root),
+            }
+            status_widget.update(label="✅ 处理完成！", state="complete")
+
+        except Exception as e:
+            status_widget.update(label=f"❌ 出错", state="error")
+            st.error(f"处理出错：{e}")
+            import traceback
+            st.code(traceback.format_exc())
+
+        overall_progress.empty()
+
+# ---------- 结果展示 ----------
+if st.session_state.results:
+    r = st.session_state.results
+    st.success("### ✅ 处理完成！")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("下载PDF", f"{r['pdf_count']} 份")
+    with c2:
+        st.metric("提取表格", f"{r['table_count']} 个")
+    with c3:
+        st.metric("生成Excel", f"{r['excel_count']} 个")
+    st.info(f"**输出目录：** `{r['output_dir']}`")
+    st.caption("文件夹结构：`{股票代码}_{公司名}/PDF/` 存放原始PDF，`{股票代码}_{公司名}/Excel/` 存放提取的表格文件。")
+
+# ---------- 底部 ----------
+st.markdown("---")
+st.caption(
+    "免责声明：本工具从巨潮资讯网 (cninfo.com.cn) 获取公开披露信息，仅供学习研究使用。"
+    "下载的文件版权归原发布方所有。请合理使用，避免频繁大规模请求。"
+)
