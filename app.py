@@ -2,6 +2,8 @@
 
 import sys
 import io
+import zipfile
+import tempfile
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -35,6 +37,8 @@ for key, val in {
     ),
     "filing_df": None,
     "results": None,
+    "download_excel_path": None,
+    "download_zip_path": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = val
@@ -43,7 +47,7 @@ for key, val in {
 # ==================== 侧边栏 ====================
 with st.sidebar:
     st.header("⚙️ 设置")
-    st.markdown(f"**输出目录：** `{DOWNLOAD_DIR}`")
+    st.markdown("工具将下载公告PDF并提取表格生成Excel。处理完成后点击下载按钮保存到本地。")
     if st.button("🔄 重置所有状态"):
         for k in list(st.session_state.keys()):
             del st.session_state[k]
@@ -68,7 +72,7 @@ with col2:
     search_btn = st.button("🔍 搜索", use_container_width=True, type="primary")
 
 if search_btn and query.strip():
-    with st.spinner("正在从巨潮资讯网获取股票列表..."):
+    with st.spinner("正在加载股票列表..."):
         st.session_state.search_results = search_company(query.strip())
     if not st.session_state.search_results:
         st.warning("未找到匹配的公司，请尝试完整的公司名称或6位股票代码。")
@@ -140,7 +144,6 @@ if st.session_state.filing_df is not None and not st.session_state.filing_df.emp
     st.header("步骤四：选择要下载的公告")
     st.markdown(f"共找到 **{len(df)}** 份公告")
 
-    # 分类统计
     if "文档类型" in df.columns:
         tc = df["文档类型"].value_counts()
         cols = st.columns(len(tc))
@@ -176,6 +179,10 @@ if st.session_state.filing_df is not None and not st.session_state.filing_df.emp
         pdf_dir.mkdir(parents=True, exist_ok=True)
         excel_dir.mkdir(parents=True, exist_ok=True)
 
+        # 清理旧结果
+        st.session_state.download_excel_path = None
+        st.session_state.download_zip_path = None
+
         status_widget = st.status("正在处理...", expanded=True)
         overall_progress = st.progress(0)
 
@@ -198,8 +205,6 @@ if st.session_state.filing_df is not None and not st.session_state.filing_df.emp
             total_pdfs = len(pdfs)
 
             for j, pdf_path in enumerate(pdfs):
-                title = pdf_path.stem
-
                 def ext_prog(cur, total):
                     pct = 0.45 + (j / max(total_pdfs, 1)) * 0.25
                     pct += (cur / max(total, 1)) * (0.25 / max(total_pdfs, 1))
@@ -207,7 +212,7 @@ if st.session_state.filing_df is not None and not st.session_state.filing_df.emp
 
                 tables = extract_tables_from_pdf(pdf_path, ext_prog)
                 all_tables.extend(tables)
-                status_widget.write(f"   {title}: {len(tables)} 个表格")
+                status_widget.write(f"   {pdf_path.stem}: {len(tables)} 个表格")
 
             status_widget.write(f"✅ 共提取 {len(all_tables)} 个表格")
             overall_progress.progress(0.80)
@@ -222,18 +227,30 @@ if st.session_state.filing_df is not None and not st.session_state.filing_df.emp
                 str(selected_df.iloc[0].get("公告时间", ""))[:4],
                 "、".join(set(selected_df["文档类型"].tolist())),
             )
-            overall_progress.progress(0.95)
+            overall_progress.progress(0.92)
 
-            status_widget.write(f"✅ Excel生成完成：{len(excel_files)} 个文件")
+            # ---- Phase 4: 打包PDF为zip ----
+            zip_path = out_root / f"{stock_code}_{company_name}_PDF.zip"
+            if pdfs:
+                status_widget.write("📦 打包PDF文件...")
+                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for p in pdfs:
+                        zf.write(p, p.name)
+                status_widget.write(f"✅ PDF打包完成")
             overall_progress.progress(1.0)
 
             st.session_state.results = {
                 "pdf_count": len(pdfs),
                 "table_count": len(all_tables),
                 "excel_count": len(excel_files),
-                "output_dir": str(out_root),
             }
-            status_widget.update(label="✅ 处理完成！", state="complete")
+            # 保存文件路径供下载
+            if excel_files:
+                st.session_state.download_excel_path = str(excel_files[0])
+            if pdfs and zip_path.exists():
+                st.session_state.download_zip_path = str(zip_path)
+
+            status_widget.update(label="✅ 处理完成！点击下方按钮下载文件", state="complete")
 
         except Exception as e:
             status_widget.update(label=f"❌ 出错", state="error")
@@ -243,10 +260,11 @@ if st.session_state.filing_df is not None and not st.session_state.filing_df.emp
 
         overall_progress.empty()
 
-# ---------- 结果展示 ----------
+# ---------- 结果展示 & 下载按钮 ----------
 if st.session_state.results:
     r = st.session_state.results
     st.success("### ✅ 处理完成！")
+
     c1, c2, c3 = st.columns(3)
     with c1:
         st.metric("下载PDF", f"{r['pdf_count']} 份")
@@ -254,8 +272,40 @@ if st.session_state.results:
         st.metric("提取表格", f"{r['table_count']} 个")
     with c3:
         st.metric("生成Excel", f"{r['excel_count']} 个")
-    st.info(f"**输出目录：** `{r['output_dir']}`")
-    st.caption("文件夹结构：`{股票代码}_{公司名}/PDF/` 存放原始PDF，`{股票代码}_{公司名}/Excel/` 存放提取的表格文件。")
+
+    # --- 下载按钮 ---
+    st.markdown("### 📥 下载文件到本地")
+
+    btn_col1, btn_col2 = st.columns(2)
+
+    with btn_col1:
+        if st.session_state.download_excel_path:
+            excel_path = Path(st.session_state.download_excel_path)
+            if excel_path.exists():
+                with open(excel_path, "rb") as f:
+                    st.download_button(
+                        label=f"📊 下载Excel表格 ({excel_path.name})",
+                        data=f,
+                        file_name=excel_path.name,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        type="primary",
+                        use_container_width=True,
+                    )
+
+    with btn_col2:
+        if st.session_state.download_zip_path:
+            zip_path = Path(st.session_state.download_zip_path)
+            if zip_path.exists():
+                with open(zip_path, "rb") as f:
+                    st.download_button(
+                        label=f"📦 下载PDF文件包 ({zip_path.name})",
+                        data=f,
+                        file_name=zip_path.name,
+                        mime="application/zip",
+                        use_container_width=True,
+                    )
+
+    st.caption("提示：手机端点击下载按钮后，文件会保存到浏览器的下载目录中。")
 
 # ---------- 底部 ----------
 st.markdown("---")

@@ -163,6 +163,6 @@ def _sanitize(name: str) -> str:
 
 
 def _sanitize_sheet(name: str) -> str:
-    """清理sheet名中的非法字符（Excel sheet名不能含: \ / * ? : [ ]）"""
+    r"""清理sheet名中的非法字符（Excel sheet名不能含: \ / * ? : [ ]）"""
     name = re.sub(r'[\\/*?:\[\]\n\r\t]', "", name)
     return name.strip().strip(".")
